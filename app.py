@@ -139,3 +139,10 @@ def dl(name: str):
         data = f.read()
     return Response(content=data, media_type=mime,
                     headers={"Content-Disposition": f'inline; filename="{name}"'})
+@app.get("/")
+def root():
+    return {"ok": True}
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
