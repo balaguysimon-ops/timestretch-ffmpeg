@@ -1,19 +1,41 @@
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Literal
-import subprocess, tempfile, os, json, uuid, urllib.request, shutil
+import subprocess, tempfile, os, json, uuid, urllib.request, shutil, time, threading
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-STORE = "/tmp/audio_out"          # stockage temporaire pour /dl/{name}
+STORE = "/tmp/audio_out"
 os.makedirs(STORE, exist_ok=True)
+
+# Cleanup: supprime les fichiers > 10 min toutes les 5 min
+def _cleanup_store():
+    while True:
+        time.sleep(300)
+        try:
+            now = time.time()
+            for f in os.listdir(STORE):
+                fp = os.path.join(STORE, f)
+                if os.path.isfile(fp) and now - os.path.getmtime(fp) > 600:
+                    os.remove(fp)
+        except Exception:
+            pass
+
+threading.Thread(target=_cleanup_store, daemon=True).start()
 
 class Req(BaseModel):
     audio_url: str
     target_duration_ms: int
-    preserve_pitch: bool = True            # atempo préserve le pitch
+    preserve_pitch: bool = True
     format_out: Literal["mp3","wav"] = "mp3"
-    bitrate_kbps: int = 192                # 192 ou 256
+    bitrate_kbps: int = 192
 
 def sh(cmd: list[str]) -> tuple[str, str]:
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -28,50 +50,35 @@ def ffprobe_duration_ms(path: str) -> int:
     ])
     return int(round(float(out.strip()) * 1000))
 
-@app.post("/process")
-def process(req: Req):
-    if req.target_duration_ms <= 0 or req.target_duration_ms > 3*60*1000:
-        raise HTTPException(413, "target_duration_ms out of bounds (0, 180000]")
+def _run_pipeline(src_path: str, target_ms: int, format_out: str, bitrate_kbps: int) -> dict:
+    """Pipeline de stretch partagé entre /process (URL) et /process-upload (fichier)."""
     MIN_F, MAX_F = 0.8, 1.25
 
     with tempfile.TemporaryDirectory() as td:
-        src   = os.path.join(td, "in")
-        pivot = os.path.join(td, "pivot.wav")
         step1 = os.path.join(td, "step1.wav")
-        step2 = os.path.join(td, "step2.wav")
         norm  = os.path.join(td, "norm.wav")
-        final = os.path.join(td, f"final.{req.format_out}")
+        final = os.path.join(td, f"final.{format_out}")
 
-        # 0) Download
-        try:
-            urllib.request.urlretrieve(req.audio_url, src)
-        except Exception as e:
-            raise HTTPException(400, f"Cannot download source: {e}")
-
-        # 1) Pivot 48k mono float
-        sh(["ffmpeg","-y","-i", src, "-ac","1","-ar","48000","-sample_fmt","fltp", pivot])
-        in_ms = ffprobe_duration_ms(pivot)
-
-        # 2) Stretch principal
-        target_ms = req.target_duration_ms
+        # 1) Pivot 24k mono + stretch principal
+        in_ms = ffprobe_duration_ms(src_path)
         F = target_ms / in_ms
         if not (MIN_F <= F <= MAX_F):
             raise HTTPException(400, f"Stretch factor {F:.3f} outside [{MIN_F},{MAX_F}]")
+
         sh([
-            "ffmpeg","-y","-i", pivot,
-            "-af", f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=mono,atempo={F:.8f}",
+            "ffmpeg","-y","-i", src_path,
+            "-af", f"aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=mono,atempo={F:.8f}",
             step1
         ])
 
-        # 3) Correction
+        # 2) Correction
         step1_ms = ffprobe_duration_ms(step1)
         F_corr = target_ms / step1_ms
-        sh(["ffmpeg","-y","-i", step1, "-af", f"atempo={F_corr:.8f}", step2])
 
-        # 4) Loudnorm (EBU R128) 2-pass + fades 10 ms
+        # 3) Loudnorm analyse (2-pass EBU R128) — passe 1
         _o, err = sh([
-            "ffmpeg","-y","-i", step2,
-            "-af","loudnorm=I=-23:LRA=7:TP=-1:print_format=json",
+            "ffmpeg","-y","-i", step1,
+            "-af", f"atempo={F_corr:.8f},loudnorm=I=-23:LRA=7:TP=-1:print_format=json",
             "-f","null","-"
         ])
         j0, j1 = err.find("{"), err.rfind("}")
@@ -79,6 +86,7 @@ def process(req: Req):
             raise HTTPException(500, "loudnorm analysis failed")
         stats = json.loads(err[j0:j1+1])
 
+        # 4) Correction + loudnorm apply + fades
         ln = (
             "loudnorm=I=-23:LRA=7:TP=-1:"
             f"measured_I={stats['input_i']}:measured_LRA={stats['input_lra']}:"
@@ -86,9 +94,9 @@ def process(req: Req):
             f"offset={stats['target_offset']}:linear=true:print_format=summary"
         )
         sh([
-            "ffmpeg","-y","-i", step2,
-            "-af", f"{ln},afade=t=in:st=0:d=0.01,afade=t=out:st=0:d=0.01",
-            "-sample_fmt","fltp","-ar","48000","-ac","1",
+            "ffmpeg","-y","-i", step1,
+            "-af", f"atempo={F_corr:.8f},{ln},afade=t=in:st=0:d=0.01,afade=t=out:st=0:d=0.01",
+            "-sample_fmt","fltp","-ar","24000","-ac","1",
             norm
         ])
 
@@ -105,8 +113,8 @@ def process(req: Req):
                     f"apad=pad_dur={pad_sec:.6f},atrim=0:{target_ms/1000.0:.6f},asetpts=N/SR/TB", norm])
 
         # 6) Encodage final
-        if req.format_out == "mp3":
-            sh(["ffmpeg","-y","-i", norm, "-c:a","libmp3lame","-b:a", f"{req.bitrate_kbps}k", final])
+        if format_out == "mp3":
+            sh(["ffmpeg","-y","-i", norm, "-c:a","libmp3lame","-b:a", f"{bitrate_kbps}k", final])
         else:
             shutil.copyfile(norm, final)
 
@@ -116,7 +124,7 @@ def process(req: Req):
 
         # 7) Expose via /dl/{name}
         fid = uuid.uuid4().hex
-        suggested = f"chronique_{fid}_{target_ms}.{req.format_out}"
+        suggested = f"chronique_{fid}_{target_ms}.{format_out}"
         store_path = os.path.join(STORE, suggested)
         shutil.copyfile(final, store_path)
 
@@ -129,6 +137,38 @@ def process(req: Req):
             "meta": {"input_duration_ms": in_ms, "post_norm_ms": norm_ms}
         }
 
+@app.post("/process")
+def process(req: Req):
+    """Stretch via URL (existant)."""
+    if req.target_duration_ms <= 0 or req.target_duration_ms > 3*60*1000:
+        raise HTTPException(413, "target_duration_ms out of bounds (0, 180000]")
+
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "in")
+        try:
+            urllib.request.urlretrieve(req.audio_url, src)
+        except Exception as e:
+            raise HTTPException(400, f"Cannot download source: {e}")
+        return _run_pipeline(src, req.target_duration_ms, req.format_out, req.bitrate_kbps)
+
+@app.post("/process-upload")
+async def process_upload(
+    file: UploadFile = File(...),
+    target_duration_ms: int = Form(...),
+    format_out: str = Form("mp3"),
+    bitrate_kbps: int = Form(192),
+):
+    """Stretch via upload direct (pas besoin d'URL publique)."""
+    if target_duration_ms <= 0 or target_duration_ms > 3*60*1000:
+        raise HTTPException(413, "target_duration_ms out of bounds (0, 180000]")
+
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "in.wav")
+        with open(src, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        return _run_pipeline(src, target_duration_ms, format_out, bitrate_kbps)
+
 @app.get("/dl/{name}")
 def dl(name: str):
     path = os.path.join(STORE, name)
@@ -139,6 +179,7 @@ def dl(name: str):
         data = f.read()
     return Response(content=data, media_type=mime,
                     headers={"Content-Disposition": f'inline; filename="{name}"'})
+
 @app.get("/")
 def root():
     return {"ok": True}
