@@ -61,24 +61,26 @@ def _run_pipeline(src_path: str, target_ms: int, format_out: str, bitrate_kbps: 
 
         # 1) Pivot 24k mono + stretch principal
         in_ms = ffprobe_duration_ms(src_path)
-        F = target_ms / in_ms
+        F = target_ms / in_ms  # ratio cible/source (ex: 0.8 = raccourcir)
         if not (MIN_F <= F <= MAX_F):
             raise HTTPException(400, f"Stretch factor {F:.3f} outside [{MIN_F},{MAX_F}]")
 
+        # atempo = vitesse de lecture : >1 accélère (raccourcit), <1 ralentit (allonge)
+        atempo_main = in_ms / target_ms
         sh([
             "ffmpeg","-y","-i", src_path,
-            "-af", f"aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=mono,atempo={F:.8f}",
+            "-af", f"aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=mono,atempo={atempo_main:.8f}",
             step1
         ])
 
         # 2) Correction
         step1_ms = ffprobe_duration_ms(step1)
-        F_corr = target_ms / step1_ms
+        atempo_corr = step1_ms / target_ms
 
         # 3) Loudnorm analyse (2-pass EBU R128) — passe 1
         _o, err = sh([
             "ffmpeg","-y","-i", step1,
-            "-af", f"atempo={F_corr:.8f},loudnorm=I=-23:LRA=7:TP=-1:print_format=json",
+            "-af", f"atempo={atempo_corr:.8f},loudnorm=I=-23:LRA=7:TP=-1:print_format=json",
             "-f","null","-"
         ])
         j0, j1 = err.find("{"), err.rfind("}")
@@ -95,8 +97,8 @@ def _run_pipeline(src_path: str, target_ms: int, format_out: str, bitrate_kbps: 
         )
         sh([
             "ffmpeg","-y","-i", step1,
-            "-af", f"atempo={F_corr:.8f},{ln},afade=t=in:st=0:d=0.01,afade=t=out:st=0:d=0.01",
-            "-sample_fmt","fltp","-ar","24000","-ac","1",
+            "-af", f"atempo={atempo_corr:.8f},{ln},afade=t=in:st=0:d=0.01,afade=t=out:st=0:d=0.01",
+            "-ar","24000","-ac","1",
             norm
         ])
 
@@ -104,13 +106,15 @@ def _run_pipeline(src_path: str, target_ms: int, format_out: str, bitrate_kbps: 
         norm_ms = ffprobe_duration_ms(norm)
         delta_ms = target_ms - norm_ms
         if abs(delta_ms) > 2:
+            trimmed = os.path.join(td, "trimmed.wav")
             if delta_ms < 0:
                 sh(["ffmpeg","-y","-i", norm, "-af",
-                    f"atrim=0:{target_ms/1000.0:.6f},asetpts=N/SR/TB", norm])
+                    f"atrim=0:{target_ms/1000.0:.6f},asetpts=N/SR/TB", trimmed])
             else:
                 pad_sec = delta_ms/1000.0
                 sh(["ffmpeg","-y","-i", norm, "-af",
-                    f"apad=pad_dur={pad_sec:.6f},atrim=0:{target_ms/1000.0:.6f},asetpts=N/SR/TB", norm])
+                    f"apad=pad_dur={pad_sec:.6f},atrim=0:{target_ms/1000.0:.6f},asetpts=N/SR/TB", trimmed])
+            shutil.move(trimmed, norm)
 
         # 6) Encodage final
         if format_out == "mp3":
@@ -119,7 +123,9 @@ def _run_pipeline(src_path: str, target_ms: int, format_out: str, bitrate_kbps: 
             shutil.copyfile(norm, final)
 
         out_ms = ffprobe_duration_ms(final)
-        if abs(out_ms - target_ms) > 1:
+        # MP3 encoder ajoute un padding incompressible (~26-60ms)
+        tolerance_ms = 80 if format_out == "mp3" else 2
+        if abs(out_ms - target_ms) > tolerance_ms:
             raise HTTPException(500, f"Final duration mismatch {out_ms} vs {target_ms}")
 
         # 7) Expose via /dl/{name}
@@ -132,7 +138,7 @@ def _run_pipeline(src_path: str, target_ms: int, format_out: str, bitrate_kbps: 
             "download_url": f"/dl/{suggested}",
             "final_duration_ms": out_ms,
             "factor": round(F, 6),
-            "factor_correction": round(F_corr, 6),
+            "factor_correction": round(atempo_corr, 6),
             "pipeline": "ffmpeg_atempo_double + loudnorm2 + fades + exact_trim",
             "meta": {"input_duration_ms": in_ms, "post_norm_ms": norm_ms}
         }
