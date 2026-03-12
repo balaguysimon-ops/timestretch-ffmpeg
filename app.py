@@ -69,7 +69,7 @@ def _run_pipeline(src_path: str, target_ms: int, format_out: str, bitrate_kbps: 
         atempo_main = in_ms / target_ms
         sh([
             "ffmpeg","-y","-i", src_path,
-            "-af", f"aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=mono,atempo={atempo_main:.8f}",
+            "-af", f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=mono,atempo={atempo_main:.8f}",
             step1
         ])
 
@@ -99,7 +99,7 @@ def _run_pipeline(src_path: str, target_ms: int, format_out: str, bitrate_kbps: 
         sh([
             "ffmpeg","-y","-i", step1,
             "-af", f"atempo={atempo_corr:.8f},{ln},afade=t=in:st=0:d=0.01,afade=t=out:st={fade_out_start:.4f}:d=0.01",
-            "-ar","24000","-ac","1",
+            "-ar","48000","-ac","1",
             norm
         ])
 
