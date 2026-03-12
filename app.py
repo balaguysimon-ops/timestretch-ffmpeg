@@ -95,9 +95,10 @@ def _run_pipeline(src_path: str, target_ms: int, format_out: str, bitrate_kbps: 
             f"measured_TP={stats['input_tp']}:measured_thresh={stats['input_thresh']}:"
             f"offset={stats['target_offset']}:linear=true:print_format=summary"
         )
+        fade_out_start = max(0, target_ms / 1000.0 - 0.01)
         sh([
             "ffmpeg","-y","-i", step1,
-            "-af", f"atempo={atempo_corr:.8f},{ln},afade=t=in:st=0:d=0.01,afade=t=out:st=0:d=0.01",
+            "-af", f"atempo={atempo_corr:.8f},{ln},afade=t=in:st=0:d=0.01,afade=t=out:st={fade_out_start:.4f}:d=0.01",
             "-ar","24000","-ac","1",
             norm
         ])
