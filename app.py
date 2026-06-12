@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Literal
-import subprocess, tempfile, os, json, uuid, urllib.request, urllib.error, shutil, time, threading
+import subprocess, tempfile, os, json, uuid, urllib.request, urllib.error, urllib.parse, shutil, time, threading
 
 app = FastAPI()
 app.add_middleware(
@@ -199,23 +199,29 @@ TTS_ALLOWED_MODELS = {"gemini-2.5-pro-preview-tts", "gemini-2.5-flash-preview-tt
 TTS_MAX_TEXT_CHARS = 8000
 TTS_UPSTREAM_TIMEOUT_S = 280  # sous le timeout requête Cloud Run (300s)
 
-def _tts_allowed_origins() -> list[str]:
+def _tts_allowed_origins() -> set[tuple[str, str]]:
+    """Paires (scheme, netloc) exactes — un préfixe laisserait passer radiolabs.fr.evil.com."""
     defaults = [
         "https://radiolabs.fr", "https://www.radiolabs.fr",
         "https://radiolabs.netlify.app",
         "http://localhost:3000", "http://localhost:8888",
     ]
     extra = [o.strip().rstrip("/") for o in os.environ.get("TTS_ALLOWED_ORIGINS", "").split(",") if o.strip()]
-    return defaults + extra
+    pairs = set()
+    for o in defaults + extra:
+        p = urllib.parse.urlparse(o)
+        if p.scheme and p.netloc:
+            pairs.add((p.scheme, p.netloc))
+    return pairs
 
 def _tts_origin_ok(request: Request) -> bool:
     allowed = _tts_allowed_origins()
-    origin = request.headers.get("origin", "")
-    referer = request.headers.get("referer", "")
-    if origin and any(origin.startswith(o) for o in allowed):
-        return True
-    if referer and any(referer.startswith(o) for o in allowed):
-        return True
+    for header in ("origin", "referer"):
+        val = request.headers.get(header, "")
+        if val:
+            p = urllib.parse.urlparse(val)
+            if (p.scheme, p.netloc) in allowed:
+                return True
     return False
 
 class TtsReq(BaseModel):
@@ -235,12 +241,22 @@ def tts(req: TtsReq, request: Request):
     if req.model not in TTS_ALLOWED_MODELS:
         raise HTTPException(403, f"Model not allowed: {req.model}")
 
+    # Borne le payload TOTAL (toutes les parts), pas juste la première —
+    # sinon on peut bourrer des mégaoctets dans les parts suivantes.
     try:
+        if len(req.contents) > 4:
+            raise HTTPException(400, "Too many contents")
+        all_parts = [p for c in req.contents for p in c.get("parts", [])]
+        if len(all_parts) > 8:
+            raise HTTPException(400, "Too many parts")
+        total_chars = sum(len(p.get("text", "")) for p in all_parts)
         text = req.contents[0]["parts"][0]["text"]
-    except (IndexError, KeyError, TypeError):
+    except HTTPException:
+        raise
+    except (IndexError, KeyError, TypeError, AttributeError):
         raise HTTPException(400, "Missing contents[0].parts[0].text")
-    if not text or len(text) > TTS_MAX_TEXT_CHARS:
-        raise HTTPException(400, f"Text length out of bounds (1, {TTS_MAX_TEXT_CHARS}]")
+    if not text or total_chars > TTS_MAX_TEXT_CHARS:
+        raise HTTPException(400, f"Total text length out of bounds (1, {TTS_MAX_TEXT_CHARS}]")
 
     voice = (req.generationConfig.get("speechConfig", {}).get("voiceConfig", {})
              .get("prebuiltVoiceConfig", {}).get("voiceName", "none"))
