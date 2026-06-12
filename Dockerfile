@@ -9,7 +9,6 @@ RUN pip3 install --no-cache-dir --break-system-packages fastapi "uvicorn[standar
 WORKDIR /app
 COPY app.py /app/app.py
 
-# Railway fournit $PORT ; on s’aligne dessus
 ENV PORT=8080
 EXPOSE 8080
 CMD ["sh","-c","uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}"]

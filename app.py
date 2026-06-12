@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Form, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Literal
-import subprocess, tempfile, os, json, uuid, urllib.request, shutil, time, threading
+import subprocess, tempfile, os, json, uuid, urllib.request, urllib.error, shutil, time, threading
 
 app = FastAPI()
 app.add_middleware(
@@ -186,6 +187,88 @@ def dl(name: str):
         data = f.read()
     return Response(content=data, media_type=mime,
                     headers={"Content-Disposition": f'inline; filename="{name}"'})
+
+# ── TTS Gemini ────────────────────────────────────────────────────────────
+# Le TTS vivait dans une Netlify Function synchrone (plafond 26s) ; les textes
+# longs (~50s de génération sur le modèle Pro) la faisaient tomber en 504.
+# Cloud Run n'a pas ce plafond : l'appel Gemini se fait ici, même contrat
+# d'échange que l'ancien proxy ({model, contents, generationConfig} → JSON brut).
+
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+TTS_ALLOWED_MODELS = {"gemini-2.5-pro-preview-tts", "gemini-2.5-flash-preview-tts"}
+TTS_MAX_TEXT_CHARS = 8000
+TTS_UPSTREAM_TIMEOUT_S = 280  # sous le timeout requête Cloud Run (300s)
+
+def _tts_allowed_origins() -> list[str]:
+    defaults = [
+        "https://radiolabs.fr", "https://www.radiolabs.fr",
+        "https://radiolabs.netlify.app",
+        "http://localhost:3000", "http://localhost:8888",
+    ]
+    extra = [o.strip().rstrip("/") for o in os.environ.get("TTS_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+    return defaults + extra
+
+def _tts_origin_ok(request: Request) -> bool:
+    allowed = _tts_allowed_origins()
+    origin = request.headers.get("origin", "")
+    referer = request.headers.get("referer", "")
+    if origin and any(origin.startswith(o) for o in allowed):
+        return True
+    if referer and any(referer.startswith(o) for o in allowed):
+        return True
+    return False
+
+class TtsReq(BaseModel):
+    model: str
+    contents: list
+    generationConfig: dict
+
+@app.post("/tts")
+def tts(req: TtsReq, request: Request):
+    if not _tts_origin_ok(request):
+        raise HTTPException(403, "Origin not allowed")
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(500, "GEMINI_API_KEY not configured")
+
+    if req.model not in TTS_ALLOWED_MODELS:
+        raise HTTPException(403, f"Model not allowed: {req.model}")
+
+    try:
+        text = req.contents[0]["parts"][0]["text"]
+    except (IndexError, KeyError, TypeError):
+        raise HTTPException(400, "Missing contents[0].parts[0].text")
+    if not text or len(text) > TTS_MAX_TEXT_CHARS:
+        raise HTTPException(400, f"Text length out of bounds (1, {TTS_MAX_TEXT_CHARS}]")
+
+    voice = (req.generationConfig.get("speechConfig", {}).get("voiceConfig", {})
+             .get("prebuiltVoiceConfig", {}).get("voiceName", "none"))
+    print(f"[TTS-REQ] model={req.model} voice={voice} temp={req.generationConfig.get('temperature')} chars={len(text)}")
+
+    body = json.dumps({"contents": req.contents, "generationConfig": req.generationConfig}).encode()
+    url = f"{GEMINI_API_BASE}/models/{req.model}:generateContent?key={api_key}"
+    t0 = time.time()
+    try:
+        http_req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(http_req, timeout=TTS_UPSTREAM_TIMEOUT_S) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode(errors="replace")[:300]
+        elapsed = round((time.time() - t0) * 1000)
+        print(f"[TTS-ERR] voice={voice} status={e.code} elapsed={elapsed}ms error={err_body}")
+        # Relayer le VRAI status Gemini (429 ≠ 504 ≠ 500) — ne jamais le masquer
+        return JSONResponse(status_code=e.code, content={"error": f"Gemini {e.code}: {err_body}"})
+    except Exception as e:
+        elapsed = round((time.time() - t0) * 1000)
+        print(f"[TTS-ERR] voice={voice} status=502 elapsed={elapsed}ms error={str(e)[:200]}")
+        return JSONResponse(status_code=502, content={"error": f"Gemini upstream error: {str(e)[:200]}"})
+
+    elapsed = round((time.time() - t0) * 1000)
+    parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [{}])
+    inline = parts[0].get("inlineData", {}) if parts else {}
+    print(f"[TTS-RES] voice={voice} mime={inline.get('mimeType', 'no-audio')} audioB64Len={len(inline.get('data', ''))} elapsed={elapsed}ms")
+    return data
 
 @app.get("/")
 def root():
